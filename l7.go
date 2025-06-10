@@ -50,10 +50,10 @@ func main() {
 
 	proxyTestFlag := flag.Bool("proxy-test", true, "Enable testing scraped proxies for quality.")
 	proxyTestTimeoutFlag := flag.Duration("proxy-test-timeout", 3*time.Second, "Timeout for proxy quick test (TCP+CONNECT/GET).")
-	proxyMaxLatencyFlag := flag.Duration("proxy-max-latency", 500*time.Millisecond, "Max acceptable latency for proxy quick test.")
-	proxyTestConcurrencyFlag := flag.Int("proxy-test-concurrency", 50, "Max concurrent proxy tests during refresh.")
-	proxyTestLimitFlag := flag.Int("proxy-test-limit", 200, "Max proxies to test per refresh (0 = all).")
-	proxyPoolSizeFlag := flag.Int("proxy-pool-size", 300, "Desired number of successful proxies to collect before stopping testing.")
+	proxyMaxLatencyFlag := flag.Duration("proxy-max-latency", 1000*time.Millisecond, "Max acceptable latency for proxy quick test.")
+	proxyTestConcurrencyFlag := flag.Int("proxy-test-concurrency", 100, "Max concurrent proxy tests during refresh.")
+	proxyTestLimitFlag := flag.Int("proxy-test-limit", 0, "Max proxies to test per refresh (0 = all).")
+	proxyPoolSizeFlag := flag.Int("proxy-pool-size", 500, "Desired number of successful proxies to collect before stopping testing.")
 
 	flag.Parse()
 
@@ -97,15 +97,7 @@ func main() {
 			}
 		}
 	} else {
-		sources = []string{
-	"https://www.proxy-list.download/api/v1/get?type=http",
-	"https://api.openproxylist.xyz/http.txt",
-	"https://openproxylist.xyz/http.txt",
-	"https://proxyspace.pro/http.txt",
-	"https://proxyspace.pro/https.txt",
-	"https://api.openproxylist.xyz/http.txt",
-	"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1000&country=all&ssl=all&anonymity=all",
-}
+		sources = []string{"https://8080-jdpst224-projectdown-4rfkvo3lqbs.ws-us120.gitpod.io/proxies"}
 	}
 
 	proxyMgr := NewProxyManager(
