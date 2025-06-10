@@ -98,11 +98,14 @@ func main() {
 		}
 	} else {
 		sources = []string{
-			"https://free-proxy-list.net/",
-			"https://www.sslproxies.org/",
-			"https://www.proxy-list.download/HTTPS",
-			"https://www.us-proxy.org/",
-		}
+	"https://www.proxy-list.download/api/v1/get?type=http",
+	"https://api.openproxylist.xyz/http.txt",
+	"https://openproxylist.xyz/http.txt",
+	"https://proxyspace.pro/http.txt",
+	"https://proxyspace.pro/https.txt",
+	"https://api.openproxylist.xyz/http.txt",
+	"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=1000&country=all&ssl=all&anonymity=all",
+}
 	}
 
 	proxyMgr := NewProxyManager(
