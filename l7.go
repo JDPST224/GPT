@@ -148,7 +148,6 @@ func runWorkers(ctx context.Context, cfg *StressConfig) {
                         if conn == nil {
                             conn, _, err = connect(proxy, target)
                             if err != nil {
-                                log.Printf("[worker %d.conn %d] dial error: %v; retrying...", id, connID, err)
                                 time.Sleep(50 * time.Millisecond)
                                 continue
                             }
@@ -161,14 +160,13 @@ func runWorkers(ctx context.Context, cfg *StressConfig) {
                             bufs[i] = hdr
                         }
                         if _, err = bufs.WriteTo(conn); err != nil {
-                            log.Printf("[worker %d.conn %d] write error: %v; reconnecting...", id, connID, err)
                             conn.Close()
                             conn = nil
                             continue
                         }
 
                         // no more than ~1ms backoff so other loops can run
-                        time.Sleep(1 * time.Millisecond)
+                        time.Sleep(10 * time.Millisecond)
                     }
                 }(cnum)
             }
